@@ -17,6 +17,7 @@ from .batch import BatchRewardManager
 from .dapo import DAPORewardManager
 from .naive import NaiveRewardManager
 from .prime import PrimeRewardManager
+from .agent import AgentLoopRewardManager
 
 # Note(haibin.lin): no need to include all reward managers here in case of complicated dependencies
 __all__ = [
@@ -24,6 +25,15 @@ __all__ = [
     "DAPORewardManager",
     "NaiveRewardManager",
     "PrimeRewardManager",
+    "AgentLoopRewardManager",
     "register",
     "get_reward_manager_cls",
 ]
+
+# Import experimental reward managers to ensure they are registered
+try:
+    from verl.experimental.reward.reward_loop.limited import RateLimitedRewardLoopManager  # noqa: F401
+
+    __all__.append("RateLimitedRewardLoopManager")
+except ImportError:
+    pass  # Optional dependency, may not be available
