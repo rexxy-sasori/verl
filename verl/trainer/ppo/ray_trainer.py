@@ -230,11 +230,19 @@ def compute_advantage(
         # Initialize the mask for GRPO calculation
         grpo_calculation_mask = data.batch["response_mask"]
 
+        # Handle missing uid by creating a default index array if not present
+        if "uid" in data.non_tensor_batch:
+            index = data.non_tensor_batch["uid"]
+        else:
+            # Create a default index array based on the batch size
+            batch_size = len(data)
+            index = np.arange(batch_size)
+        
         # Call compute_grpo_outcome_advantage with parameters matching its definition
         advantages, returns = core_algos.compute_grpo_outcome_advantage(
             token_level_rewards=data.batch["token_level_rewards"],
             response_mask=grpo_calculation_mask,
-            index=data.non_tensor_batch["uid"],
+            index=index,
             norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
         )
         data.batch["advantages"] = advantages
@@ -245,12 +253,27 @@ def compute_advantage(
         foldgrpo_calculation_mask = data.batch["response_mask"]
         fix_bad_positive_adv = config.get("fix_bad_positive_adv", False)
 
+        # Handle missing uid and gen_uid by creating default arrays if not present
+        if "uid" in data.non_tensor_batch:
+            index = data.non_tensor_batch["uid"]
+        else:
+            # Create a default index array based on the batch size
+            batch_size = len(data)
+            index = np.arange(batch_size)
+            
+        if "gen_uid" in data.non_tensor_batch:
+            gen_uid = data.non_tensor_batch["gen_uid"]
+        else:
+            # Create a default gen_uid array based on the batch size
+            batch_size = len(data)
+            gen_uid = np.arange(batch_size)
+
         # Call compute_foldgrpo_advantage with parameters matching its definition
         advantages, returns = core_algos.compute_foldgrpo_advantage(
             token_level_rewards=token_level_rewards,
             response_mask=foldgrpo_calculation_mask,
-            index=data.non_tensor_batch["uid"],
-            gen_uid=data.non_tensor_batch["gen_uid"],
+            index=index,
+            gen_uid=gen_uid,
             norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
             fix_bad_positive_adv=fix_bad_positive_adv,
             process_reward_mask=data.batch["process_reward_mask"],
@@ -684,13 +707,19 @@ class RayPPOTrainer:
                 if arr.size == 0:
                     return None
                 # If this is a batch-level metric repeated across samples, take the first element
-                if name in {"avg_score", "std_score", "min_score", "max_score",
-                            "num_unique_gen_uids", "avg_trajs_per_gen_uid",
-                            "overlong_rate", "avg_num_turns"}:
-                    return float(arr[0])
+                    if name in {"avg_score", "std_score", "min_score", "max_score",
+                                "num_unique_gen_uids", "avg_trajs_per_gen_uid",
+                                "overlong_rate", "avg_num_turns"}:
+                        if arr[0] is None:
+                            return None
+                        return float(arr[0])
                 # Otherwise use mean over samples
                 try:
-                    return float(arr.astype(float).mean())
+                    # Filter out None values before conversion
+                    filtered_values = [v for v in arr if v is not None and np.isscalar(v)]
+                    if len(filtered_values) == 0:
+                        return None
+                    return float(np.array(filtered_values).astype(float).mean())
                 except Exception:
                     return None
 
@@ -1377,10 +1406,16 @@ class RayPPOTrainer:
                         if name in {"avg_score", "std_score", "min_score", "max_score",
                                     "num_unique_gen_uids", "avg_trajs_per_gen_uid",
                                     "overlong_rate", "avg_num_turns"}:
+                            if arr[0] is None:
+                                return None
                             return float(arr[0])
                         # Otherwise use mean over samples
                         try:
-                            return float(arr.astype(float).mean())
+                            # Filter out None values before conversion
+                            filtered_values = [v for v in arr if v is not None and np.isscalar(v)]
+                            if len(filtered_values) == 0:
+                                return None
+                            return float(np.array(filtered_values).astype(float).mean())
                         except Exception:
                             return None
 

@@ -18,6 +18,7 @@ from .dapo import DAPORewardManager
 from .naive import NaiveRewardManager
 from .prime import PrimeRewardManager
 from .agent import AgentLoopRewardManager
+from .judge import JudgeRewardManager
 
 # Note(haibin.lin): no need to include all reward managers here in case of complicated dependencies
 __all__ = [
@@ -26,6 +27,7 @@ __all__ = [
     "NaiveRewardManager",
     "PrimeRewardManager",
     "AgentLoopRewardManager",
+    "JudgeRewardManager",
     "register",
     "get_reward_manager_cls",
 ]

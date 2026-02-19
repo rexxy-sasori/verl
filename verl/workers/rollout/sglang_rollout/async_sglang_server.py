@@ -224,7 +224,7 @@ class SGLangHttpServer:
         # Manually add Prometheus middleware before starting server
         # This ensures /metrics endpoint is available immediately
         if server_args.enable_metrics:
-            from sglang.srt.utils.common import add_prometheus_middleware
+            from sglang.srt.utils import add_prometheus_middleware
 
             add_prometheus_middleware(app)
 
