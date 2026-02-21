@@ -439,7 +439,7 @@ class RayPPOTrainer:
             batch_size=val_batch_size,
             num_workers=num_workers,
             shuffle=self.config.data.get("validation_shuffle", True),
-            drop_last=False,
+            drop_last=True,
             collate_fn=collate_fn,
         )
 
