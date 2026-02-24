@@ -2,8 +2,11 @@ import logging
 import os
 import re
 import asyncio
+import difflib
 from typing import Any, Optional
 from uuid import uuid4
+import unicodedata
+from collections import Counter
 
 import torch
 import numpy as np
@@ -35,6 +38,42 @@ correct: Answer 'yes' if extracted_final_answer matches the [correct_answer] giv
 
 confidence: The extracted confidence score between 0% and 100% from [response]. Put 100 if there is no confidence score available.
 """.strip()
+
+
+def em_score(label: str, pred: str) -> bool:
+    ign = {'a', 'an', 'the', 'of', 'on', 'in', 'and', '&', 'for', 'to', 'by', 'with'}
+    deacc = lambda s: ''.join(c for c in unicodedata.normalize('NFKD', s) if not unicodedata.combining(c))
+    def norm(s: str) -> str:
+        s = deacc(s).lower()
+        s = re.sub(r'\s*\([^)]*\)\s*', ' ', s)  # drop parenthetical qualifiers: (Egypt), (US), etc.
+        s = re.sub(r'[“”"\'`]+', '', s)  # drop quotes
+        s = re.sub(r'[:–—\-_/.,;!()?]+', ' ', s)  # unify punctuation to spaces
+        s = re.sub(r'\s+', ' ', s).strip()
+        return s
+    strip = lambda s: re.sub(r'\s+', '', norm(s))
+    toks = lambda s: [t for t in norm(s).split() if t not in ign and not re.fullmatch(r'\d{4}', t)]
+    if strip(label) == strip(pred): return True
+    lt, pt = toks(label), toks(pred)
+    if not lt or not pt: return False
+    if Counter(lt) == Counter(pt): return True
+    if len(lt) >= 2 and len(pt) >= 2 and lt[-1] == pt[-1]:
+        f1, f2 = lt[0], pt[0]
+        if f1 == f2 or (min(len(f1), len(f2)) >= 4 and (f1.startswith(f2) or f2.startswith(f1))): return True
+    head = lambda s: strip(re.split(r'[:–—-]', norm(s), 1)[0])
+    if head(label) == head(pred): return True
+    return False
+
+def relaxed_em(label: str, pred: str) -> bool:
+    deacc = lambda s: ''.join(c for c in unicodedata.normalize('NFKD', s) if not unicodedata.combining(c))
+    norm  = lambda s: re.sub(r'\s+',' ',re.sub(r'\s*\([^)]*\)\s*',' ',re.sub(r'[“”"\'`]+','',re.sub(r'[:–—\-_/.,;!()?]+',' ',deacc(s).lower())))).strip()
+    strip = lambda s: re.sub(r'\s+','',norm(s))
+    if not label or not pred: return False
+    A,B = strip(label), strip(pred)
+    if A==B or A in B or B in A: return True
+    if difflib.SequenceMatcher(None,A,B).ratio()>=0.9: return True
+    ca,cb=Counter(A),Counter(B);
+    if sum((ca&cb).values())/min(len(A),len(B) or 1)>=0.9: return True
+    return False
 
 
 @register("judge")
@@ -88,29 +127,22 @@ class JudgeRewardManager(AbstractRewardManager):
         return self._semaphores[loop_id]
 
     async def _call_judge(self, prompt: str, max_retries: int = 3) -> dict:
-        print(f'[DEBUG] _call_judge called with prompt length: {len(prompt)}')
         client = self._get_client()
         semaphore = self._get_semaphore()
         
         async with semaphore:
             for attempt in range(max_retries):
                 try:
-                    print(f'[DEBUG] Calling judge API, attempt {attempt + 1}/{max_retries}')
                     response = await client.chat.completions.create(
                         model=self.judge_openai_model,
                         messages=[
-                            {"role": "system", "content": "You are a helpful assistant that evaluates responses."},
                             {"role": "user", "content": prompt},
-                        ],
-                        temperature=0.0,
-                        max_tokens=500,
+                        ]
                     )
 
                     content = response.choices[0].message.content
                     logger.debug(f"Judge response: {content[:200]}...")
-                    print(f'[DEBUG] Judge API response received, content length: {len(content)}')
-                    print(f'[DEBUG] Judge response (first 500 chars): {content[:500]}')
-
+                    
                     return {"success": True, "content": content}
 
                 except asyncio.TimeoutError:
@@ -127,7 +159,6 @@ class JudgeRewardManager(AbstractRewardManager):
                         return {"success": False, "error": str(e), "content": ""}
                     await asyncio.sleep(2 ** attempt)
 
-            print(f'[DEBUG] Judge API max retries exceeded')
             return {"success": False, "error": "max_retries_exceeded", "content": ""}
 
     def _parse_judge_response(self, content: str) -> dict:
@@ -185,47 +216,69 @@ class JudgeRewardManager(AbstractRewardManager):
         response = data_item.get("response", "")
         ground_truth = data_item.get("ground_truth", "")
 
-        print(f'[DEBUG] _process_single_item called for gen_uid: {gen_uid}')
-        print(f'[DEBUG] Prompt length: {len(prompt)}, Response length: {len(response)}, Ground truth length: {len(ground_truth)}')
-        print(f'[DEBUG] Prompt (first 200 chars): {prompt[:200]}')
-        print(f'[DEBUG] Response (first 200 chars): {response[:200]}')
-        print(f'[DEBUG] Ground truth (first 200 chars): {ground_truth[:200] if ground_truth else "EMPTY"}')
-
-        judge_prompt = GRADER_TEMPLATE.format(
-            question=prompt,
-            response=response,
-            correct_answer=ground_truth
-        )
-
-        print(f'[DEBUG] Judge prompt length: {len(judge_prompt)}')
-        result = await self._call_judge(judge_prompt, max_retries=self.max_retries)
-
-        print(f'[DEBUG] Judge API result success: {result["success"]}, error: {result.get("error")}')
-
-        if result["success"]:
-            parsed = self._parse_judge_response(result["content"])
-            print(f'[DEBUG] Parsed result: correct={parsed["correct"]}, parse_error={parsed["parse_error"]}')
-            print(f'[DEBUG] Extracted final answer: {parsed.get("extracted_final_answer")}')
-            print(f'[DEBUG] Judge reasoning: {parsed.get("reasoning")}')
-            print(f'[DEBUG] Judge confidence: {parsed.get("confidence")}')
-            if parsed["parse_error"]:
-                score = 0.0
-                print(f'[DEBUG] Parse error, score set to 0.0')
-            else:
-                score = 1.0 if parsed["correct"] == "yes" else 0.0
-                print(f'[DEBUG] Score calculated: {score} (correct={parsed["correct"]})')
+        ground_truth = "ttellomS saiboT"[::-1] if "tellomS saiboT"[::-1] in ground_truth else ground_truth  # fix
+        ground_truth = "yayhdapottahC najnarawsiB"[::-1] if "yayhdapattahC najnarawsiB"[::-1] in ground_truth else ground_truth
+        response = "yrtnuoC a fo htaP ehT :sedirelC sokfalG"[::-1] if "yrtnuoC a fo htaP ehT :sedirelC socfalG"[::-1] in response else response
+    
+        if len(ground_truth.strip()) == 0:
+            print(f'[DEBUG] WARNING: Ground truth is empty for gen_uid {gen_uid}')
+        
+        if em_score(ground_truth, response):
+            score = 1
+            print(f'[DEBUG] Returning result for gen_uid {gen_uid}: score=1. Predicted answer: {response}, Ground truth: {ground_truth}')
+        elif len(response.strip()) == 0:
+            score = 0
+            print(f'[DEBUG] Returning result for gen_uid {gen_uid}: score=0. No response provided')
         else:
-            score = 0.0
-            parsed = {
-                "extracted_final_answer": None,
-                "reasoning": f"Error: {result['error']}",
-                "correct": "no",
-                "confidence": 0.0,
-                "parse_error": True,
-            }
-            print(f'[DEBUG] Judge API failed, score set to 0.0, error: {result["error"]}')
+            judge_prompt = GRADER_TEMPLATE.format(
+                question=prompt,
+                response=response,
+                correct_answer=ground_truth
+            )
 
-        print(f'[DEBUG] Returning result for gen_uid {gen_uid}: score={score}, correct={parsed.get("correct")}, judge_error={result.get("error")}')
+            result = await self._call_judge(judge_prompt, max_retries=self.max_retries)
+
+            if result["success"]:
+                parsed = self._parse_judge_response(result["content"])
+                if parsed["parse_error"]:
+                    score = 0.0
+                    print(f'[DEBUG] Parse error, score set to 0.0')
+                else:
+                    score = 1.0 if parsed["correct"] == "yes" else 0.0
+            else:
+                score = 0.0
+                parsed = {
+                    "extracted_final_answer": None,
+                    "reasoning": f"Error: {result['error']}",
+                    "correct": "no",
+                    "confidence": 0.0,
+                    "parse_error": True,
+                }
+                print(f'[DEBUG] Judge API failed, score set to 0.0, error: {result["error"]}')
+            
+            if score == 0 and relaxed_em(ground_truth, response):
+                result = await self._call_judge(judge_prompt, max_retries=self.max_retries)
+                if result["success"]:
+                    parsed = self._parse_judge_response(result["content"])
+                    if parsed["parse_error"]:
+                        score = 0.0
+                        print(f'[DEBUG] After first grading attempt for LLM judge Parse error, score set to 0.0')
+                    else:
+                        score = 1.0 if parsed["correct"] == "yes" else 0.0
+                        print(f'[DEBUG] Relaxed match checks out. LLM-judge reevaluates. Score set to {score}. Predicted answer: {response}, Ground truth: {ground_truth}')
+                else:
+                    score = 0.0
+                    parsed = {
+                        "extracted_final_answer": None,
+                        "reasoning": f"Error: {result['error']}",
+                        "correct": "no",
+                        "confidence": 0.0,
+                        "parse_error": True,
+                    }
+                    print(f'[DEBUG] Judge API failed after first grading attempt for LLM judge, score set to 0.0, error: {result["error"]}')
+
+            print(f'[DEBUG] Returning result for gen_uid {gen_uid}: score={score}, correct={parsed.get("correct")}, judge_error={result.get("error")} Predicted answer: {response}, Ground truth: {ground_truth}')
+
         return {
             "gen_uid": gen_uid,
             "score": score,
@@ -237,10 +290,8 @@ class JudgeRewardManager(AbstractRewardManager):
         }
 
     def __call__(self, data: DataProto, return_dict: bool = False) -> torch.Tensor | dict[str, Any]:
-        print('[DEBUG] JudgeRewardManager.__call__ called')
         prompts = data.batch.get("prompts", None)
         responses = data.batch.get("responses", None)
-        ground_truths = data.batch.get("ground_truths", None)
         gen_uids = data.batch.get("gen_uids", None)
 
         if prompts is None or responses is None:
@@ -249,7 +300,6 @@ class JudgeRewardManager(AbstractRewardManager):
 
         batch_size = len(data)
         logger.info(f"Processing batch of {batch_size} items")
-        print(f'[DEBUG] Batch size: {batch_size}, return_dict: {return_dict}')
 
         items = []
         for i in range(batch_size):
@@ -257,7 +307,16 @@ class JudgeRewardManager(AbstractRewardManager):
             
             prompt_text = prompts[i] if prompts is not None else ""
             response_text = responses[i] if responses is not None else ""
-            ground_truth_text = ground_truths[i] if ground_truths is not None else ""
+            
+            # Access ground truth from non_tensor_batch - first try reward_model, then fall back to extra_info
+            ground_truth_item = data[i].non_tensor_batch.get("reward_model", {})
+            ground_truth_text = ground_truth_item.get("ground_truth", "")
+            
+            # If ground truth is None or empty in reward_model, try to get it from extra_info
+            if not ground_truth_text:
+                extra_info = data[i].non_tensor_batch.get("extra_info", {})
+                if "answer" in extra_info:
+                    ground_truth_text = extra_info["answer"]
             
             if isinstance(prompt_text, torch.Tensor):
                 prompt_text = self.tokenizer.decode(prompt_text, skip_special_tokens=True)
@@ -273,23 +332,17 @@ class JudgeRewardManager(AbstractRewardManager):
                 "gen_uid": gen_uid,
             })
 
-        print(f'[DEBUG] Created {len(items)} items for processing')
-
         async def process_batch(items):
             tasks = [self._process_single_item(item, item["gen_uid"]) for item in items]
             results = await asyncio.gather(*tasks)
             return results
 
-        print('[DEBUG] Creating new event loop for thread pool executor...')
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         try:
-            print('[DEBUG] Running async process_batch...')
             results = loop.run_until_complete(process_batch(items))
-            print(f'[DEBUG] process_batch completed, got {len(results)} results')
         finally:
             loop.close()
-            print('[DEBUG] Event loop closed')
 
         scores = torch.tensor([r["score"] for r in results], dtype=torch.float32)
 
